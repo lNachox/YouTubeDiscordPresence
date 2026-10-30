@@ -1,289 +1,298 @@
-// Node.js version of YouTubeDiscordPresence (buttons and no watermark!)
-// MAIN VARIABLE INITIALIZATION
-const { version } = require('./version.json');
+"use strict";
 
-let rpc = require("discord-rpc");
+const net = require("net");
+const os = require("os");
+const path = require("path");
+const dbus = require("dbus-next");
+const dotenv = require("dotenv");
 
-const LOGGING = true;
-
-const YT_APP_ID = "847682519214456862";
-const YT_MUSIC_APP_ID = "1064295774592180254";
-let currentApplication = {
-    type: "youtube", // "youtube" or "youtubeMusic"
-    id: YT_APP_ID
-}
-
-const IDLE_MESSAGE = "#*IDLE*#";
-const CSM = "0_SUCCESS"; // CLIENT_SUCCESS_MESSAGE
-const CEM = "1_CLIENT_ERROR"; // CLIENT_ERROR_MESSAGE
-
-// MULTI-CLIENT STATE
-// Each entry: { client, pipeIndex, ready }
-let clients = [];
-
-// SEND MESSAGE
-
-function sendNativeVersion() {
-    let dataObject = { nativeVersion: version };
-    let buffer = Buffer.from(JSON.stringify(dataObject));
-    let header = Buffer.alloc(4);
-
-    header.writeUInt32LE(buffer.length, 0);
-    let data = Buffer.concat([header, buffer]);
-    process.stdout.write(data);
-}
-
-function sendExtensionMessage(success, message, err = null) {
-    if (!LOGGING) return;
-
-    let formattedMessage = null;
-    if (success) {
-        formattedMessage = `${CSM}: ${message}`;
-    }
-    else {
-        if (err) formattedMessage = `${CEM}: ${message}: ${err}`;
-        else formattedMessage = `${CEM}: ${message}`;
-    }
-
-    let dataObject = { data: formattedMessage };
-    let buffer = Buffer.from(JSON.stringify(dataObject));
-    let header = Buffer.alloc(4);
-
-    header.writeUInt32LE(buffer.length, 0);
-    let data = Buffer.concat([header, buffer]);
-    process.stdout.write(data);
-};
-
-// VERIFY DISCORD-RPC PATCH IS APPLIED
-const IPCTransport = require("discord-rpc/src/transports/ipc");
-if (!IPCTransport.prototype.connect.toString().includes("getIPCAtIndex")) {
-    sendExtensionMessage(false, "FATAL_RUNTIME_ERROR", "The 'discord-rpc' package is not patched. Please run 'npm run patch' or 'npx patch-package' in the NodeHost directory.");
-    // if not applied, will only attach to pipe 0 even if multiple discord clients are found
-}
-
-// PRESENCE HANDLERS
-
-async function updatePresence(presenceData, layer) {
-    if (clients.length === 0) {
-        sendExtensionMessage(false, "NO_CLIENTS_CONNECTED");
-        return;
-    }
-
-    let results = await Promise.allSettled(clients.map(async (entry) => {
-        try {
-            await entry.client.request("SET_ACTIVITY", {
-                pid: process.pid,
-                activity: presenceData
-            });
-            return { pipeIndex: entry.pipeIndex, success: true };
-        } catch (err) {
-            // Try reconnecting this specific client
-            if (layer === 0) {
-                try {
-                    let newClient = new rpc.Client({ transport: "ipc", pipeIndex: entry.pipeIndex });
-                    await newClient.login({ clientId: currentApplication.id });
-                    await newClient.request("SET_ACTIVITY", {
-                        pid: process.pid,
-                        activity: presenceData
-                    });
-                    // Only replace the old client after SET_ACTIVITY succeeds
-                    entry.client = newClient;
-                    entry.ready = true;
-                    return { pipeIndex: entry.pipeIndex, success: true, reconnected: true };
-                } catch (loginErr) {
-                    return { pipeIndex: entry.pipeIndex, success: false, error: loginErr };
-                }
-            }
-            return { pipeIndex: entry.pipeIndex, success: false, error: err };
-        }
-    }));
-
-    let anySuccess = results.some(r => r.status === "fulfilled" && r.value.success);
-    if (anySuccess) {
-        sendExtensionMessage(true, "PRESENCE_UPDATED");
-    } else {
-        let errors = results
-            .filter(r => r.status === "fulfilled" && !r.value.success)
-            .map(r => `Pipe ${r.value.pipeIndex}: ${r.value.error}`)
-            .join("; ");
-        sendExtensionMessage(false, "PRESENCE_UPDATING_ERROR", errors || "All clients failed");
-        clearPresence();
-    }
-}
-
-function clearPresence(callback = null) {
-    if (clients.length === 0) {
-        if (callback) callback();
-        return;
-    }
-
-    Promise.allSettled(clients.map(async (entry) => {
-        try {
-            await entry.client.request("SET_ACTIVITY", {
-                pid: process.pid,
-                activity: null
-            });
-            return { pipeIndex: entry.pipeIndex, success: true };
-        } catch (err) {
-            // Try reconnecting
-            try {
-                let newClient = new rpc.Client({ transport: "ipc", pipeIndex: entry.pipeIndex });
-                await newClient.login({ clientId: currentApplication.id });
-                entry.client = newClient;
-                entry.ready = true;
-                await newClient.request("SET_ACTIVITY", {
-                    pid: process.pid,
-                    activity: null
-                });
-                return { pipeIndex: entry.pipeIndex, success: true };
-            } catch (loginErr) {
-                return { pipeIndex: entry.pipeIndex, success: false, error: `${String(err)}, ${String(loginErr)}` };
-            }
-        }
-    })).then((results) => {
-        let anySuccess = results.some(r => r.status === "fulfilled" && r.value.success);
-        if (anySuccess) {
-            sendExtensionMessage(true, "PRESENCE_CLEARED");
-        } else {
-            let errors = results
-                .filter(r => r.status === "fulfilled" && !r.value.success)
-                .map(r => `Pipe ${r.value.pipeIndex}: ${r.value.error}`)
-                .join("; ");
-            sendExtensionMessage(false, "CLIENT_CONNECTION_ERROR", errors || "All clients failed to clear");
-        }
-        if (callback) callback();
-    });
-}
-
-// CLIENT CONNECTION — discover and connect to ALL Discord pipes
-
-async function discoverAndConnect(shouldLog = true) {
-    let connectedPipes = new Set(clients.map(c => c.pipeIndex));
-
-    for (let pipeIndex = 0; pipeIndex < 4; pipeIndex++) {
-        if (connectedPipes.has(pipeIndex)) continue; // already connected
-
-        try {
-            let client = new rpc.Client({ transport: "ipc", pipeIndex: pipeIndex });
-            client.on("ready", () => {
-                sendExtensionMessage(true, `CLIENT_READY_PIPE_${pipeIndex}`);
-            });
-            
-            // Add disconnect handler to remove stale clients
-            client.on("disconnected", () => {
-                const index = clients.findIndex(c => c.pipeIndex === pipeIndex);
-                if (index !== -1) {
-                    clients.splice(index, 1);
-                    sendExtensionMessage(true, `CLIENT_DISCONNECTED_PIPE_${pipeIndex}`);
-                }
-            });
-            
-            await client.login({ clientId: currentApplication.id });
-            clients.push({ client, pipeIndex: pipeIndex, ready: true });
-            sendExtensionMessage(true, `CONNECTED_TO_PIPE_${pipeIndex}`);
-        } catch (err) {
-            // pipe not available or connection failed, skip
-        }
-    }
-
-    if (shouldLog) {
-        if (clients.length === 0) {
-            sendExtensionMessage(false, "NO_DISCORD_CLIENTS_CONNECTED");
-        } else {
-            sendExtensionMessage(true, `CONNECTED_TO_${clients.length}_DISCORD_CLIENTS`);
-        }
-    }
-}
-
-// Initial connection
-discoverAndConnect();
-
-// Periodically check for new Discord clients
-const clientDiscoveryInterval = setInterval(() => discoverAndConnect(false), 10000);
-
-// // READING DATA FROM BROWSER EXTENSION
-// // REFERENCED FROM: https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_messaging#app_side
-
-let payloadSize = null;
-let chunks = [];
-
-const sizeHasBeenRead = () => payloadSize !== null;
-const flushChunksQueue = () => {
-    payloadSize = null;
-    chunks.splice(0);
-};
-
-function handleExtensionPayload(json) {
-    if (json.jsApplicationType && json.jsApplicationType != currentApplication.type) {
-        currentApplication.type = json.jsApplicationType;
-        currentApplication.id = (currentApplication.type == "youtube") ? YT_APP_ID : YT_MUSIC_APP_ID;
-
-        async function resetPresence() {
-            // Destroy all existing clients
-            for (const entry of clients) {
-                try {
-                    await entry.client.destroy();
-                } catch (e) {
-                    // ignore destroy errors
-                }
-            }
-            clients = [];
-
-            // Reconnect all with new app ID
-            await discoverAndConnect();
-
-            // Update presence on all new clients
-            updatePresence(json.presenceData, 0);
-        }
-        clearPresence(resetPresence);
-    }
-    else {
-        updatePresence(json.presenceData, 0);
-    }
-}
-
-const processData = () => {
-    const stringData = Buffer.concat(chunks);
-    if (!sizeHasBeenRead()) payloadSize = stringData.readUInt32LE(0);
-
-    if (stringData.length >= (payloadSize + 4)) {
-        const contentWithoutSize = stringData.slice(4, (payloadSize + 4));
-        flushChunksQueue();
-
-        try {
-            const json = JSON.parse(contentWithoutSize);
-            if (json.presenceData == IDLE_MESSAGE) {
-                sendExtensionMessage(true, "CLEAR_REQUEST_RECEIVED");
-                clearPresence();
-            }
-            else if (json.presenceData) {
-                sendExtensionMessage(true, "UPDATE_REQUEST_RECEIVED");
-                handleExtensionPayload(json)
-            }
-            else if (json.getNativeVersion) {
-                sendExtensionMessage(true, "VERSION_REQUEST_RECEIVED");
-                sendNativeVersion();
-            }
-        }
-        catch (err) {
-            sendExtensionMessage(false, "FATAL_RUNTIME_ERROR", err);
-        }
-    }
-};
-
-process.stdin.on("readable", () => {
-    let chunk = null;
-    while ((chunk = process.stdin.read()) !== null) {
-        chunks.push(chunk);
-    }
-    if (chunks.length > 0) processData();
+dotenv.config({
+    path: process.env.YTDP_ENV_FILE || path.join(__dirname, "..", ".env")
 });
 
-process.stdin.on("end", async () => {
-    clearInterval(clientDiscoveryInterval);
+const YOUTUBE_APP_ID = process.env.YTDP_YOUTUBE_CLIENT_ID;
+const YOUTUBE_MUSIC_APP_ID = process.env.YTDP_YOUTUBE_MUSIC_CLIENT_ID;
+const DBUS_PROPERTIES_XML = `<!DOCTYPE node>
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="GetAll">
+      <arg direction="in" type="s"/>
+      <arg direction="out" type="a{sv}"/>
+    </method>
+  </interface>
+</node>`;
 
-    const activeClients = clients;
-    clients = [];
-    await Promise.allSettled(activeClients.map(entry => entry.client.destroy()));
-    process.exit(0);
+function log(message, error = null) {
+    process.stderr.write(`[ytdiscord] ${message}${error ? `: ${error.message || error}` : ""}\n`);
+}
+
+function requiredEnvironment(name) {
+    const value = process.env[name]?.trim();
+    if (!value) throw new Error(`falta la variable de entorno ${name}; consulta .env.example`);
+    return value;
+}
+
+function valueOf(value, fallback = null) {
+    return value && Object.prototype.hasOwnProperty.call(value, "value") ? value.value : (value ?? fallback);
+}
+
+function stringOf(value) {
+    if (Array.isArray(value)) return value.find(item => typeof item === "string") || "";
+    return typeof value === "string" ? value : "";
+}
+
+function socketCandidates() {
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const runtime = process.env.XDG_RUNTIME_DIR || (uid === null ? null : `/run/user/${uid}`);
+    if (process.env.DISCORD_IPC_PATH) return [process.env.DISCORD_IPC_PATH];
+    const candidates = [
+        ...(runtime ? Array.from({ length: 10 }, (_, i) => path.join(runtime, `discord-ipc-${i}`)) : []),
+        ...(runtime ? Array.from({ length: 10 }, (_, i) => path.join(runtime, "app/com.discordapp.Discord", `discord-ipc-${i}`)) : []),
+        ...Array.from({ length: 10 }, (_, i) => path.join(os.homedir(), ".var/app/com.discordapp.Discord/.config/discord", `discord-ipc-${i}`))
+    ];
+    return [...new Set(candidates)];
+}
+
+class DiscordRpc {
+    constructor() {
+        this.socket = null;
+        this.buffer = Buffer.alloc(0);
+        this.pending = new Map();
+        this.sequence = 0;
+        this.clientId = YOUTUBE_APP_ID;
+        this.ready = null;
+    }
+
+    async connect() {
+        if (this.socket && !this.socket.destroyed) return;
+        let lastError;
+        for (const socketPath of socketCandidates()) {
+            try {
+                await this.open(socketPath);
+                log(`conectado a Discord mediante ${socketPath}`);
+                return;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+        throw new Error(`no se encontró el socket IPC de Discord (${lastError?.message || "sin rutas disponibles"})`);
+    }
+
+    open(socketPath) {
+        return new Promise((resolve, reject) => {
+            const socket = net.createConnection(socketPath);
+            const fail = error => {
+                socket.destroy();
+                reject(error);
+            };
+            socket.once("connect", () => {
+                this.socket = socket;
+                socket.on("data", data => this.onData(data));
+                socket.on("close", () => this.reset());
+                socket.on("error", error => log("error del socket Discord", error));
+                this.ready = new Promise((readyResolve, readyReject) => {
+                    this.readyResolve = readyResolve;
+                    this.readyReject = readyReject;
+                });
+                this.send(0, { v: 1, client_id: this.clientId })
+                    .then(() => this.ready)
+                    .then(resolve)
+                    .catch(fail);
+            });
+            socket.once("error", fail);
+        });
+    }
+
+    async send(opcode, payload) {
+        if (!this.socket || this.socket.destroyed) throw new Error("Discord IPC no está conectado");
+        const body = Buffer.from(JSON.stringify(payload));
+        const packet = Buffer.alloc(8 + body.length);
+        packet.writeUInt32LE(opcode, 0);
+        packet.writeUInt32LE(body.length, 4);
+        body.copy(packet, 8);
+        await new Promise((resolve, reject) => this.socket.write(packet, error => error ? reject(error) : resolve()));
+    }
+
+    request(command, args) {
+        const nonce = `${process.pid}-${++this.sequence}`;
+        return new Promise((resolve, reject) => {
+            this.pending.set(nonce, { resolve, reject });
+            this.send(1, { cmd: command, args, nonce }).catch(error => {
+                this.pending.delete(nonce);
+                reject(error);
+            });
+        });
+    }
+
+    onData(data) {
+        this.buffer = Buffer.concat([this.buffer, data]);
+        while (this.buffer.length >= 8) {
+            const size = this.buffer.readUInt32LE(4);
+            if (this.buffer.length < size + 8) return;
+            const message = JSON.parse(this.buffer.subarray(8, size + 8).toString());
+            this.buffer = this.buffer.subarray(size + 8);
+            if (message.evt === "READY" && this.readyResolve) {
+                this.readyResolve(message);
+                this.readyResolve = null;
+                this.readyReject = null;
+            }
+            if (message.nonce && this.pending.has(message.nonce)) {
+                const request = this.pending.get(message.nonce);
+                this.pending.delete(message.nonce);
+                message.evt === "ERROR" ? request.reject(new Error(message.data?.message || "Discord RPC error")) : request.resolve(message);
+            }
+        }
+    }
+
+    reset() {
+        if (this.readyReject) this.readyReject(new Error("Discord IPC desconectado"));
+        this.ready = null;
+        this.readyResolve = null;
+        this.readyReject = null;
+        for (const request of this.pending.values()) request.reject(new Error("Discord IPC desconectado"));
+        this.pending.clear();
+        this.socket = null;
+    }
+
+    async setActivity(activity, clientId = this.clientId) {
+        if (clientId !== this.clientId) {
+            this.clientId = clientId;
+            if (this.socket) this.socket.destroy();
+            this.reset();
+        }
+        await this.connect();
+        await this.request("SET_ACTIVITY", { pid: process.pid, activity });
+    }
+
+    async clear() {
+        if (this.socket && !this.socket.destroyed) await this.request("SET_ACTIVITY", { pid: process.pid, activity: null });
+    }
+}
+
+class MprisMonitor {
+    constructor(onActivity) {
+        this.onActivity = onActivity;
+        this.bus = null;
+        this.timer = null;
+    }
+
+    async start() {
+        this.bus = dbus.sessionBus();
+        await new Promise((resolve, reject) => {
+            this.bus.once("connect", resolve);
+            this.bus.once("error", reject);
+        });
+        this.bus.on("error", error => log("error de la sesión DBus", error));
+        await this.refresh();
+        this.timer = setInterval(() => this.refresh().catch(error => log("no se pudo actualizar MPRIS", error)), 3000);
+        log("monitor MPRIS activo");
+    }
+
+    isCandidate(name) {
+        return /^org\.mpris\.MediaPlayer2\./.test(name) && /firefox|chrome|chromium|brave|youtube.?music|ytmd/i.test(name);
+    }
+
+    async refresh() {
+        const object = await this.bus.getProxyObject("org.freedesktop.DBus", "/org/freedesktop/DBus");
+        const names = await object.getInterface("org.freedesktop.DBus").ListNames();
+        const activities = [];
+        for (const name of names.filter(item => this.isCandidate(item))) {
+            try {
+                const activity = await this.readPlayer(name);
+                if (activity) activities.push(activity);
+            } catch (error) {
+                log(`no se pudo leer el reproductor MPRIS ${name}`, error);
+            }
+        }
+        await this.onActivity(activities.find(item => item.playbackStatus === "Playing") || null);
+    }
+
+    async readPlayer(name) {
+        // Chromium-based browsers sometimes implement MPRIS correctly but
+        // return an empty introspection document.
+        const object = await this.bus.getProxyObject(name, "/org/mpris/MediaPlayer2", DBUS_PROPERTIES_XML);
+        const properties = object.getInterface("org.freedesktop.DBus.Properties");
+        const values = await properties.GetAll("org.mpris.MediaPlayer2.Player");
+        const metadata = valueOf(values.Metadata, {});
+        const url = stringOf(valueOf(metadata["xesam:url"], ""));
+        const artUrl = stringOf(valueOf(metadata["mpris:artUrl"], ""));
+        const identity = String(valueOf(values.Identity, name));
+        const title = stringOf(valueOf(metadata["xesam:title"], ""));
+        const artist = stringOf(valueOf(metadata["xesam:artist"], ""));
+        const status = String(valueOf(values.PlaybackStatus, "Stopped"));
+        const youtubeApp = /youtube.?music|ytmd|ytmdesktop|app\.ytmdesktop/i.test(`${name} ${identity} ${artUrl}`);
+        const browserPlayer = /firefox|chrome|chromium|brave/i.test(`${name} ${identity}`);
+        let hostname = "";
+        try { hostname = new URL(url).hostname; } catch (_) { /* Some players omit xesam:url. */ }
+        const isYouTube = /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(hostname);
+        // Chromium-based browsers frequently omit xesam:url. In that case,
+        // an active browser MPRIS session is the only available media source.
+        if (!title || (!isYouTube && !youtubeApp && !(browserPlayer && status === "Playing"))) return null;
+        const length = Number(valueOf(metadata["mpris:length"], 0)) / 1000000;
+        const position = Number(valueOf(values.Position, 0)) / 1000000;
+        return { title: title.substring(0, 128), artist: artist.substring(0, 128), url, status, playbackStatus: status, music: youtubeApp || /music\.youtube\.com/i.test(hostname), length, position };
+    }
+
+    stop() {
+        if (this.timer) clearInterval(this.timer);
+        if (this.bus) this.bus.disconnect();
+    }
+}
+
+function makeActivity(media) {
+    const activity = {
+        type: media.music ? 2 : 3,
+        details: media.title,
+        state: media.artist || (media.music ? "YouTube Music" : "YouTube"),
+        assets: { large_image: media.music ? "youtube-music" : "youtube3", large_text: media.title }
+    };
+    if (media.length > 0) {
+        const start = Date.now() - Math.max(0, media.position) * 1000;
+        activity.timestamps = { start, end: start + media.length * 1000 };
+    }
+    if (media.music) activity.status_display_type = 2;
+    if (media.url) activity.buttons = [{ label: media.music ? "Listen Along" : "Watch Video", url: media.url }];
+    return activity;
+}
+
+async function main() {
+    requiredEnvironment("YTDP_YOUTUBE_CLIENT_ID");
+    requiredEnvironment("YTDP_YOUTUBE_MUSIC_CLIENT_ID");
+    const rpc = new DiscordRpc();
+    let active = false;
+    let lastActivityKey = "";
+    const monitor = new MprisMonitor(async media => {
+        try {
+            if (!media) {
+                if (active) await rpc.clear();
+                active = false;
+                lastActivityKey = "";
+                return;
+            }
+            const clientId = media.music ? YOUTUBE_MUSIC_APP_ID : YOUTUBE_APP_ID;
+            const activityKey = `${clientId}:${media.title}:${media.artist}`;
+            if (activityKey !== lastActivityKey) {
+                log(`actividad detectada: ${media.music ? "YouTube Music" : "YouTube"} - ${media.title} - ${media.artist || "sin artista"}`);
+                lastActivityKey = activityKey;
+            }
+            await rpc.setActivity(makeActivity(media), clientId);
+            active = true;
+        } catch (error) {
+            active = false;
+            log("no se pudo actualizar Discord; se reintentará", error);
+        }
+    });
+    await monitor.start();
+    const shutdown = async () => {
+        monitor.stop();
+        try { await rpc.clear(); } catch (_) { /* Discord puede haberse cerrado. */ }
+        process.exit(0);
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+}
+
+main().catch(error => {
+    log("error fatal", error);
+    process.exitCode = 1;
 });

@@ -7,7 +7,12 @@
         <img src="https://img.shields.io/badge/License-MIT-yellow" /></a>
 </p>
 
-**YouTubeDiscordPresence** (YTDP) is a desktop application and browser extension used to create a detailed rich presence for YouTube and YouTube Music on Discord. Only **Windows (x64)** is supported, although more operating systems may be supported in the future.
+**YouTubeDiscordPresence** (YTDP) is a browser extension and companion host that creates a detailed rich presence for YouTube and YouTube Music on Discord. Linux is supported natively through MPRIS/DBus on Fedora 44 and compatible distributions; Windows remains supported through the original native host.
+
+For the Spanish documentation, see [README_ES.md](README_ES.md). The complete
+portability and migration notes are available in
+[English](PORTABILITY_AND_MIGRATION_NOTES.txt) and
+[Spanish](NOTAS_DE_PORTABILIDAD_Y_MIGRACION.txt).
 
 <br>
 
@@ -32,8 +37,36 @@ If you've already downloaded the extension, **skip the first step!**
 <a href="https://chromewebstore.google.com/detail/youtubediscordpresence/hnmeidgkfcbpjjjpmjmpehjdljlaeaaa"><img alt="Download on the Chrome Web Store" src="https://developer.chrome.com/static/docs/webstore/branding/image/HRs9MPufa1J1h5glNhut.png" height=60px></img></a>
 <a href="https://addons.mozilla.org/en-US/firefox/addon/youtubediscordpresence/"><img alt="Download on the Firefox Addon Store" src="https://extensionworkshop.com/assets/img/documentation/publish/get-the-addon-178x60px.dad84b42.png" height=60px></img></a>
 
-2. Download the latest `YTDPsetup.msi` file in [**<ins>Releases</ins>**](https://github.com/XFG16/YouTubeDiscordPresence/releases/latest) and **run it on your device** to install the secondary desktop component.
-   - **Note:** Only Windows is currently supported.
+2. On Fedora 44, clone the repository and install the Linux host:
+
+   ```bash
+   git clone https://github.com/XFG16/YouTubeDiscordPresence.git
+   cd YouTubeDiscordPresence
+   sudo dnf install nodejs npm dbus-tools
+   mkdir -p ~/.local/share/ytdiscord ~/.config/ytdiscord
+   cp -a NodeHost ~/.local/share/ytdiscord/
+   cp ~/.local/share/ytdiscord/NodeHost/.env.example ~/.config/ytdiscord/ytdiscord.env
+   cd ~/.local/share/ytdiscord/NodeHost
+   npm install --omit=dev
+   ```
+
+   Edit `~/.config/ytdiscord/ytdiscord.env` and set
+   `YTDP_YOUTUBE_CLIENT_ID` and `YTDP_YOUTUBE_MUSIC_CLIENT_ID`.
+   These are public Discord application identifiers, not passwords or tokens.
+
+   Install the service for the current user and start it:
+
+   ```bash
+   mkdir -p ~/.config/systemd/user
+   cp ~/.local/share/ytdiscord/NodeHost/ytdiscord.service ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now ytdiscord.service
+   ```
+
+   The service reads MPRIS sessions from Firefox, Chrome, Chromium, Brave,
+   and YouTube Music Desktop. It uses the Discord IPC socket in
+   `$XDG_RUNTIME_DIR`, including `/run/user/<uid>/app/com.discordapp.Discord/discord-ipc-0`
+   for Flatpak Discord.
 
 Still confused? Watch the **installation tutorial** on YouTube using [**<ins>this link</ins>**](https://www.youtube.com/watch?v=BWPNqPGFyL4).
 
@@ -59,7 +92,26 @@ Go [here](https://github.com/XFG16/YouTubeDiscordPresence/issues/new/choose) and
 
 ## Building
 
-Desktop application:
+Linux host:
+
+- The Fedora host runs directly from `NodeHost/src/app.js`; no Windows executable or
+  native build step is required.
+- To test the host in the foreground:
+
+  ```bash
+  cd NodeHost
+  npm test
+  YTDP_ENV_FILE="$HOME/.config/ytdiscord/ytdiscord.env" npm start
+  ```
+
+- To inspect the user service:
+
+  ```bash
+  systemctl --user status ytdiscord.service
+  journalctl --user -u ytdiscord.service -f
+  ```
+
+Windows desktop application:
 
 - `npm run compile`
 - Replace the existing `YTDPwin.exe` in `C:\Program Files\YouTubeDiscordPresence` with the newly compiled one.

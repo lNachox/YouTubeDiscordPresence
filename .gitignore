@@ -12,4 +12,5 @@ NodeHost/node_modules
 NodeHost/src/app-linux
 NodeHost/src/app-macos
 .env
+*.env
 NodeHost/src/version.json

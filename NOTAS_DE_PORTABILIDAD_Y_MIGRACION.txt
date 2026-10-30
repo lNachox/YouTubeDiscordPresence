@@ -1,0 +1,127 @@
+YouTubeDiscordPresence
+Notas de portabilidad y migración: de Windows a Fedora Linux
+===============================================================
+
+Alcance
+-------
+Este documento registra la migración del host de escritorio original de
+YouTubeDiscordPresence para ejecutarlo de forma nativa en Fedora 44. La
+extensión del navegador sigue siendo un componente separado; el host de Linux
+reemplaza el ayudante nativo de Windows.
+
+1. Arquitectura original de Windows
+------------------------------------
+El host original dependía de componentes nativos de Windows y de una
+integración de Discord RPC pensada para un ejecutable empaquetado para Windows.
+La instalación y el modelo de host usaban archivos MSI, native messaging y
+rutas propias de Windows.
+
+2. Entorno de Linux y dependencias
+----------------------------------
+El host de Linux se ejecuta como un proceso Node.js dentro de la sesión gráfica
+del usuario. Dependencias de Fedora:
+
+    sudo dnf install nodejs npm dbus-tools
+
+La dependencia Node dbus-next permite acceder al DBus de sesión del usuario.
+El paquete dotenv carga la configuración desde un archivo de entorno del
+del usuario. El host Linux no necesita Windows Media Control, MSI, el runtime
+de Windows ni empaquetado nativo de Windows.
+
+3. Sustitución de la captura de medios por MPRIS
+------------------------------------------------
+En Linux, los reproductores exponen la información de reproducción mediante
+la especificación MPRIS en el DBus de sesión. El host enumera servicios
+org.mpris.MediaPlayer2.* y lee:
+
+    PlaybackStatus
+    Metadata
+    xesam:title
+    xesam:artist
+    xesam:url
+    mpris:length
+    Position
+
+Se consideran proveedores Firefox, Chrome, Chromium, Brave y YouTube Music
+Desktop. Los navegadores basados en Chromium pueden publicar un documento de
+introspección DBus vacío y omitir xesam:url; por eso la implementación declara
+explícitamente la interfaz Properties y acepta una sesión activa del navegador
+cuando existe un título.
+
+El filtro solo acepta dominios de YouTube, identificadores de YouTube Music o
+una sesión activa de un navegador reconocido. Los demás medios se ignoran.
+YouTube Music Desktop se reconoce mediante su identidad MPRIS y su ruta de
+arte, incluyendo app.ytmdesktop.ytmdesktop.
+
+4. Transporte Linux para Discord RPC
+-------------------------------------
+La biblioteca Discord RPC de Windows se sustituyó por un cliente IPC compatible
+con Linux, implementado con el módulo net de Node. El cliente:
+
+    - busca sockets discord-ipc-* dentro de XDG_RUNTIME_DIR;
+    - comprueba la ruta de runtime de Discord instalado mediante Flatpak;
+    - admite DISCORD_IPC_PATH como configuración explícita;
+    - espera el evento READY de Discord antes de enviar SET_ACTIVITY;
+    - limpia la actividad al cerrar y vuelve a conectarse en los siguientes
+      ciclos de consulta.
+
+Los Client ID de las aplicaciones de Discord son identificadores públicos, pero
+se configuran mediante variables de entorno en lugar de estar escritos en el
+código:
+
+    YTDP_YOUTUBE_CLIENT_ID
+    YTDP_YOUTUBE_MUSIC_CLIENT_ID
+
+5. Configuración y privacidad
+-----------------------------
+Copia NodeHost/.env.example a:
+
+    ~/.config/ytdiscord/ytdiscord.env
+
+El archivo real de entorno está excluido por Git. En los archivos rastreados
+no se necesitan contraseñas, cookies, claves privadas, tokens de API ni rutas
+personales del directorio home. El servicio utiliza el especificador %h de
+systemd y guarda el runtime en:
+
+    ~/.local/share/ytdiscord
+
+6. Servicio systemd del usuario
+-------------------------------
+El archivo del servicio es NodeHost/ytdiscord.service. Instálalo con:
+
+    mkdir -p ~/.config/systemd/user
+    cp ~/.local/share/ytdiscord/NodeHost/ytdiscord.service \
+       ~/.config/systemd/user/
+    systemctl --user daemon-reload
+    systemctl --user enable --now ytdiscord.service
+
+Diagnóstico útil:
+
+    systemctl --user status ytdiscord.service
+    journalctl --user -u ytdiscord.service -f
+
+7. Validaciones realizadas
+--------------------------
+La portabilidad se validó con:
+
+    node --check NodeHost/src/app.js
+    npm test
+    systemd-analyze verify NodeHost/ytdiscord.service
+    git diff --check
+
+También se comprobó la sesión Fedora real para verificar los servicios MPRIS y
+la disponibilidad del socket IPC de Discord. Una prueba en primer plano
+detectó una canción de YouTube Music, su artista, estado de reproducción y
+progreso, y después se conectó con Discord mediante el socket compatible con
+Discord Flatpak.
+
+8. Limitaciones operativas
+--------------------------
+Discord Desktop debe estar ejecutándose; el cliente web de Discord no expone
+el transporte IPC local necesario. El navegador o YouTube Music Desktop debe
+publicar metadatos MPRIS. Algunos proveedores omiten las URL, por lo que se
+utiliza como alternativa una sesión activa de un navegador reconocido.
+
+Los archivos de compilación originales de Windows se conservan para usuarios
+de Windows. El host Linux no se compila dentro del ejecutable de Windows y se
+ejecuta como un servicio systemd del usuario.
