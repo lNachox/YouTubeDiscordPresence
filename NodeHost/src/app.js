@@ -41,6 +41,16 @@ function stringOf(value) {
     return typeof value === "string" ? value : "";
 }
 
+function youtubeUrl(value) {
+    try {
+        const parsed = new URL(value);
+        if (parsed.protocol !== "https:") return "";
+        return /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(parsed.hostname) ? parsed.href : "";
+    } catch (_) {
+        return "";
+    }
+}
+
 function socketCandidates() {
     const uid = typeof process.getuid === "function" ? process.getuid() : null;
     const runtime = process.env.XDG_RUNTIME_DIR || (uid === null ? null : `/run/user/${uid}`);
@@ -224,13 +234,14 @@ class MprisMonitor {
         const browserPlayer = /firefox|chrome|chromium|brave/i.test(`${name} ${identity}`);
         let hostname = "";
         try { hostname = new URL(url).hostname; } catch (_) { /* Some players omit xesam:url. */ }
-        const isYouTube = /(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(hostname);
+        const safeUrl = youtubeUrl(url);
+        const isYouTube = Boolean(safeUrl);
         // Chromium-based browsers frequently omit xesam:url. In that case,
         // an active browser MPRIS session is the only available media source.
         if (!title || (!isYouTube && !youtubeApp && !(browserPlayer && status === "Playing"))) return null;
         const length = Number(valueOf(metadata["mpris:length"], 0)) / 1000000;
         const position = Number(valueOf(values.Position, 0)) / 1000000;
-        return { title: title.substring(0, 128), artist: artist.substring(0, 128), url, status, playbackStatus: status, music: youtubeApp || /music\.youtube\.com/i.test(hostname), length, position };
+        return { title: title.substring(0, 128), artist: artist.substring(0, 128), url: safeUrl, status, playbackStatus: status, music: youtubeApp || /music\.youtube\.com/i.test(hostname), length, position };
     }
 
     stop() {
